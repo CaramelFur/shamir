@@ -1,160 +1,158 @@
-use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit},
-    Aes256Gcm, Key,
-};
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256};
-
 mod shamir;
-use shamir::SecretData;
+mod wrapper;
 
+use std::{path::PathBuf, io::{Write, stdout}};
+
+use anyhow::{Ok, Result};
 use clap::Parser;
+use std::fs;
 
-/// Simple program to greet a person
+use crate::wrapper::from_shares;
+
+/// A program that helps you encrypt and decrypt files using Shamir's Secret Sharing
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Name of the person to greet
-    #[arg(short, long)]
-    input: String,
-
-    /// Number of times to greet
-    #[arg(short, long, default_value_t = 1)]
-    count: u8,
+#[command(author, version)]
+struct Cli {
+    #[command(subcommand)]
+    command: SubCommand,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ShareInfo {
-    length: usize,
+#[derive(Parser, Debug)]
+enum SubCommand {
+    /// Encrypt a file
+    Encrypt(EncryptCommand),
+    /// Decrypt a file
+    Decrypt(DecryptCommand),
+}
+
+#[derive(Parser, Debug)]
+struct EncryptCommand {
+    /// The number of shares to create
+    #[clap(short, long, default_value = "5")]
     shares: u8,
-    hash: [u8; 32],
-    key: [u8; 32],
-    nonce: [u8; 12],
+
+    /// The threshold of shares needed to decrypt
+    #[clap(short, long, default_value = "3")]
+    threshold: u8,
+
+    /// The output folder
+    #[clap(short, long)]
+    output: PathBuf,
+
+    /// The file to encrypt
+    file: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Share {
-    info: Vec<u8>,
-    data: Vec<u8>,
+#[derive(Parser, Debug)]
+struct DecryptCommand {
+    /// The output file
+    #[clap(short, long)]
+    output: Option<PathBuf>,
+
+    /// The files to decrypt
+    files: Vec<PathBuf>,
 }
 
-fn create_unverifyable_shares(input: Vec<u8>, threshold: u8, count: u8) -> Result<Vec<Vec<u8>>> {
-    let secret_data = SecretData::with_secret(input, threshold);
-    let mut shares: Vec<Vec<u8>> = Vec::new();
-    for i in 1..=count {
-        let share = secret_data.get_share(i)?;
-        shares.push(share);
-    }
-    Ok(shares)
-}
+fn main() -> Result<()> {
+    let args = Cli::parse();
 
-fn create_verifyable_shares(input: Vec<u8>, threshold: u8, count: u8) -> Result<Vec<Vec<u8>>> {
-    let mut rng = rand::thread_rng();
-
-    let key = Aes256Gcm::generate_key(&mut rng);
-    let nonce = Aes256Gcm::generate_nonce(&mut rng);
-
-    let info = ShareInfo {
-        length: input.len(),
-        shares: count,
-        hash: Sha3_256::digest(&input).into(),
-        key: key.into(),
-        nonce: nonce.into(),
+    match args.command {
+        SubCommand::Encrypt(arguments) => handle_encrypt(arguments)?,
+        SubCommand::Decrypt(arguments) => handle_decrypt(arguments)?,
     };
 
-    let info_serialized = bincode::serialize(&info).unwrap();
-
-    let unverifyable_shares = create_unverifyable_shares(info_serialized, threshold, count)?;
-
-    // Encrypt input with aes-gcm crate
-    let cipher = Aes256Gcm::new(&key);
-    let ciphertext = cipher
-        .encrypt(&nonce, input.as_slice())
-        .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
-
-    let mut shares: Vec<Vec<u8>> = Vec::new();
-    for i in 0..count as usize {
-        let share = Share {
-            info: unverifyable_shares[i].to_vec(),
-            data: ciphertext.to_vec(),
-        };
-
-        let share_serialized = bincode::serialize(&share).unwrap();
-        shares.push(share_serialized);
-    }
-
-    Ok(shares)
+    Ok(())
 }
 
-fn retrieve_from_shares(input: Vec<Vec<u8>>) -> Result<Vec<u8>> {
-    // Return if no shares are given
-    if input.len() == 0 {
-        return Ok(vec![]);
+fn handle_encrypt(arguments: EncryptCommand) -> Result<()> {
+    // Get reference to output folder, and check if it exists and is a folder, don't create it
+    if !arguments.output.exists() {
+        return Err(anyhow::anyhow!(
+            "Output folder \"{}\" does not exist",
+            arguments.output.display()
+        ));
     }
 
-    let mut shares: Vec<Share> = Vec::new();
-    for share in input {
-        let share: Share = bincode::deserialize(&share)?;
-        shares.push(share);
+    if !arguments.output.is_dir() {
+        return Err(anyhow::anyhow!(
+            "Output folder \"{}\" is not a folder",
+            arguments.output.display()
+        ));
     }
 
-    // Check if all shares have the same encrypted data
-    let encrypted_data: Vec<u8> = shares[0].data.to_vec();
-    for share in shares.iter_mut() {
-        if share.data != encrypted_data {
-            return Err(anyhow::anyhow!("Shares do not match"));
+    // Get reference to file, and check if it exists and is a file
+    if !arguments.file.exists() {
+        return Err(anyhow::anyhow!(
+            "File \"{}\" does not exist",
+            arguments.file.display()
+        ));
+    }
+
+    if !arguments.file.is_file() {
+        return Err(anyhow::anyhow!(
+            "File \"{}\" is not a file",
+            arguments.file.display()
+        ));
+    }
+
+    // Read file into vec
+    let file_data = fs::read(arguments.file)?;
+    let shares = wrapper::to_shares(file_data, arguments.threshold, arguments.shares)?;
+
+    // Write shares to output folder
+    for (i, share) in shares.iter().enumerate() {
+        let share_path = arguments.output.join(format!("share{}.ss", i));
+        fs::write(share_path, share)?;
+    }
+
+    println!("Done");
+
+    Ok(())
+}
+
+fn handle_decrypt(arguments: DecryptCommand) -> Result<()> {
+    if let Some(output) = arguments.output.to_owned() {
+        // Check if output file is creatable, (as in, it is in a folder that exists)
+        if !output.parent().unwrap().exists() {
+            return Err(anyhow::anyhow!(
+                "Cannot create output file \"{}\"",
+                output.display()
+            ));
         }
-        share.data.clear(); // Not needed anymore
     }
 
-    // Decrypt share info
-    let decrypted = SecretData::recover_secret(
-        shares
-            .iter()
-            .map(|s| s.info.to_vec())
-            .collect::<Vec<Vec<u8>>>(),
-    )?;
+    // Check if input files exist and are files
+    for file in arguments.files.iter() {
+        if !file.exists() {
+            return Err(anyhow::anyhow!(
+                "File \"{}\" does not exist",
+                file.display()
+            ));
+        }
 
-    let info: ShareInfo = bincode::deserialize(&decrypted)?;
-
-    // Decrypt data
-    let key = Key::<Aes256Gcm>::from_slice(&info.key);
-    let cipher = Aes256Gcm::new(key);
-    let plaintext = cipher
-        .decrypt(&info.nonce.into(), encrypted_data.as_ref())
-        .map_err(|_| anyhow::anyhow!("Decryption failed"))?;
-
-    // Check if hash matches
-    let hash: [u8; 32] = Sha3_256::digest(&plaintext).into();
-    if info.hash != hash {
-        return Err(anyhow::anyhow!("Hashes do not match"));
+        if !file.is_file() {
+            return Err(anyhow::anyhow!("File \"{}\" is not a file", file.display()));
+        }
     }
 
-    Ok(plaintext)
-}
+    // Read shares
+    let mut shares: Vec<Vec<u8>> = Vec::new();
+    for file in arguments.files.iter() {
+        shares.push(fs::read(file)?);
+    }
 
-fn main() {
-    println!("Hello, world!");
+    // Decrypt shares
+    let decrypted = from_shares(shares)?;
 
-    let shares = create_verifyable_shares("Test Data Helloa".as_bytes().into(), 3, 5).unwrap();
+    // Write decrypted data to output file
+    if let Some(output) = arguments.output.to_owned() {
+        fs::write(output, decrypted)?;
 
-    // log all
-    println!("share2: {} {:x?}", shares[1].len(), shares[1]);
-    println!("share1: {} {:x?}", shares[0].len(), shares[0]);
-    println!("share3: {} {:x?}", shares[2].len(), shares[2]);
-    println!("share4: {} {:x?}", shares[3].len(), shares[3]);
-    println!("share5: {} {:x?}", shares[4].len(), shares[4]);
+        println!("Done");
+    } else {
+        // Write to stdout
+        stdout().write_all(&decrypted)?;
+    }
 
-    // Delete share 1 and 3
-    let mut shares2 = shares.clone();
-    shares2.remove(1);
-    shares2.remove(3);
-    shares2.remove(0);
-
-    let retrieved = retrieve_from_shares(shares2).unwrap();
-    println!("retrieved: {:?}", retrieved);
-
-    // print as utf8
-    println!("retrieved: {}", String::from_utf8(retrieved).unwrap());
+    Ok(())
 }
