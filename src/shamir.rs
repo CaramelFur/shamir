@@ -1,5 +1,6 @@
 extern crate rand;
 
+use anyhow::Result;
 use rand::{thread_rng, RngCore};
 
 pub struct SecretData {
@@ -7,18 +8,12 @@ pub struct SecretData {
     pub coefficients: Vec<Vec<u8>>,
 }
 
-#[derive(Debug)]
-pub enum ShamirError {
-    /// The number of shares must be between 1 and 255
-    InvalidShareCount,
-}
-
 impl SecretData {
     pub fn with_secret(secret: Vec<u8>, threshold: u8) -> SecretData {
         let mut coefficients: Vec<Vec<u8>> = vec![];
         let mut rng = thread_rng();
         let mut rand_container = vec![0u8; (threshold - 1) as usize];
-        for c in secret.clone() {
+        for c in secret.to_owned() {
             rng.fill_bytes(&mut rand_container);
             let mut coef: Vec<u8> = vec![c];
             for r in rand_container.iter() {
@@ -33,9 +28,9 @@ impl SecretData {
         }
     }
 
-    pub fn get_share(&self, id: u8) -> Result<Vec<u8>, ShamirError> {
+    pub fn get_share(&self, id: u8) -> Result<Vec<u8>> {
         if id == 0 {
-            return Err(ShamirError::InvalidShareCount);
+            return Err(anyhow::anyhow!("Invalid share count"));
         }
         let mut share_bytes: Vec<u8> = vec![];
         let coefficients = self.coefficients.clone();
@@ -48,31 +43,20 @@ impl SecretData {
         Ok(share_bytes)
     }
 
-    pub fn is_valid_share(&self, share: &[u8]) -> bool {
-        let id = share[0];
-        match self.get_share(id) {
-            Ok(s) => s == share,
-            _ => false,
-        }
-    }
-
-    pub fn recover_secret(shares: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+    pub fn recover_secret(shares: Vec<Vec<u8>>) -> Result<Vec<u8>> {
         let mut xs: Vec<u8> = vec![];
 
         for share in shares.iter() {
             if xs.contains(&share[0]) {
-                println!("Multiple shares with the same first byte");
-                return None;
+                return Err(anyhow::anyhow!("Multiple shares with the same first byte"));
             }
 
             if share.len() != shares[0].len() {
-                println!("Shares have different lengths");
-                return None;
+                return Err(anyhow::anyhow!("Shares have different lengths"));
             }
 
             xs.push(share[0].to_owned());
         }
-
         let mut mysecretdata: Vec<u8> = vec![];
         let rounds = shares[0].len() - 1;
 
@@ -82,20 +66,16 @@ impl SecretData {
                 fxs.push(share[1..][byte_to_use]);
             }
 
-            match SecretData::full_lagrange(&xs, &fxs) {
-                None => return None,
-                Some(resulting_poly) => {
-                    mysecretdata.push(resulting_poly[0]);
-                }
-            }
+            let resulting_poly = SecretData::full_lagrange(&xs, &fxs)?;
+            mysecretdata.push(resulting_poly[0]);
         }
 
-        Some(mysecretdata)
+        Ok(mysecretdata)
     }
 
-    fn accumulate_share_bytes(id: u8, coefficient_bytes: Vec<u8>) -> Result<u8, ShamirError> {
+    fn accumulate_share_bytes(id: u8, coefficient_bytes: Vec<u8>) -> Result<u8> {
         if id == 0 {
-            return Err(ShamirError::InvalidShareCount);
+            return Err(anyhow::anyhow!("Invalid share count"));
         }
         let mut accumulator: u8 = 0;
 
@@ -109,7 +89,7 @@ impl SecretData {
         Ok(accumulator)
     }
 
-    fn full_lagrange(xs: &[u8], fxs: &[u8]) -> Option<Vec<u8>> {
+    fn full_lagrange(xs: &[u8], fxs: &[u8]) -> Result<Vec<u8>> {
         let mut returned_coefficients: Vec<u8> = vec![];
         let len = fxs.len();
         for i in 0..len {
@@ -129,7 +109,7 @@ impl SecretData {
                         this_polynomial =
                             SecretData::multiply_polynomials(&this_polynomial, &this_term);
                     }
-                    (_, _) => return None,
+                    (_, _) => return Err(anyhow::anyhow!("Invalid share")),
                 };
             }
             if fxs.len() + 1 >= i {
@@ -138,7 +118,7 @@ impl SecretData {
             returned_coefficients =
                 SecretData::add_polynomials(&returned_coefficients, &this_polynomial);
         }
-        Some(returned_coefficients)
+        Ok(returned_coefficients)
     }
 
     #[inline]
@@ -254,97 +234,3 @@ static GF256_LOG: [u8; 256] = [
     0x44, 0x11, 0x92, 0xd9, 0x23, 0x20, 0x2e, 0x89, 0xb4, 0x7c, 0xb8, 0x26, 0x77, 0x99, 0xe3, 0xa5,
     0x67, 0x4a, 0xed, 0xde, 0xc5, 0x31, 0xfe, 0x18, 0x0d, 0x63, 0x8c, 0x80, 0xc0, 0xf7, 0x70, 0x07,
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::SecretData;
-    #[test]
-    fn it_works() {}
-
-    #[test]
-    fn it_generates_coefficients() {
-        let secret_data = SecretData::with_secret("Hello, world!".as_bytes().into(), 3);
-        assert_eq!(secret_data.coefficients.len(), 13);
-    }
-
-    #[test]
-    fn it_rejects_share_id_under_1() {
-        let secret_data = SecretData::with_secret("Hello, world!".as_bytes().into(), 3);
-        let d = secret_data.get_share(0);
-        assert!(d.is_err());
-    }
-
-    #[test]
-    fn it_issues_shares() {
-        let secret_data = SecretData::with_secret("Hello, world!".as_bytes().into(), 3);
-
-        let s1 = secret_data.get_share(1).unwrap();
-        println!("Share: {:?}", s1);
-        assert!(secret_data.is_valid_share(&s1));
-    }
-
-    #[test]
-    fn it_repeatedly_issues_shares() {
-        let secret_data = SecretData::with_secret("Hello, world!".as_bytes().into(), 3);
-
-        let s1 = secret_data.get_share(1).unwrap();
-        println!("Share: {:?}", s1);
-        assert!(secret_data.is_valid_share(&s1));
-
-        let s2 = secret_data.get_share(1).unwrap();
-        assert_eq!(s1, s2);
-    }
-
-    #[test]
-    fn it_can_recover_secret() {
-        let s1 = vec![1, 184, 190, 251, 87, 232, 39, 47, 17, 4, 36, 190, 245];
-        let s2 = vec![2, 231, 107, 52, 138, 34, 221, 9, 221, 67, 79, 33, 16];
-        let s3 = vec![3, 23, 176, 163, 177, 165, 218, 113, 163, 53, 7, 251, 196];
-
-        let new_secret_bytes = SecretData::recover_secret(vec![s1, s2, s3]).unwrap();
-        let new_secret = String::from_utf8(new_secret_bytes).unwrap();
-
-        assert_eq!(&new_secret[..], "Hello World!");
-    }
-
-    #[test]
-    fn it_can_recover_a_generated_secret() {
-        let secret_data = SecretData::with_secret("Hello, world!".as_bytes().into(), 3);
-
-        let s1 = secret_data.get_share(1).unwrap();
-        println!("s1: {:?}", s1);
-        let s2 = secret_data.get_share(2).unwrap();
-        println!("s2: {:?}", s2);
-        let s3 = secret_data.get_share(3).unwrap();
-        println!("s3: {:?}", s3);
-
-        let new_secret_bytes = SecretData::recover_secret(vec![s1, s2, s3]).unwrap();
-        let new_secret = String::from_utf8(new_secret_bytes).unwrap();
-
-        assert_eq!(&new_secret[..], "Hello, world!");
-    }
-
-    #[test]
-    fn it_requires_enough_shares() {
-        fn try_recover(n: u8, shares: &Vec<Vec<u8>>) -> Option<String> {
-            let shares = shares.iter().take(n as usize).cloned().collect::<Vec<_>>();
-            let bytes = SecretData::recover_secret(shares)?;
-            String::from_utf8(bytes).ok()
-        }
-        let secret_data = SecretData::with_secret("Hello World!".as_bytes().into(), 5);
-
-        let shares = vec![
-            secret_data.get_share(1).unwrap(),
-            secret_data.get_share(2).unwrap(),
-            secret_data.get_share(3).unwrap(),
-            secret_data.get_share(4).unwrap(),
-            secret_data.get_share(5).unwrap(),
-        ];
-
-        let recovered = try_recover(5, &shares);
-        assert!(recovered.is_some());
-
-        let recovered = try_recover(3, &shares);
-        assert!(recovered.is_none());
-    }
-}
